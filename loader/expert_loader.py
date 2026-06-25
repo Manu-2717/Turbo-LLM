@@ -7,18 +7,25 @@ from safetensors import safe_open
 from cache.ram_cache import RAMCache
 
 class ExpertLoader:
+    DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+    )
     def __init__(self, snapshot_path, config=None):
         self.snapshot_path = snapshot_path
         self.config = config
         
         # Memory / VRAM config
         self.max_vram_gb = 5.8
-        if config and "memory" in config and "max_vram_mb" in config["memory"]:
+        if config and "memory" in config and "max_vram_mb" in config:
             self.max_vram_gb = config["memory"]["max_vram_mb"] / 1024.0
             
         # Dtype config
         self.dtype = torch.float16
-        if config and "execution" in config and "dtype" in config["execution"]:
+        if config and "execution" in config and "dtype" in config:
             dtype_str = config["execution"]["dtype"]
             if dtype_str in ("bf16", "bfloat16"):
                 self.dtype = torch.bfloat16
@@ -35,7 +42,7 @@ class ExpertLoader:
         
         # Expert limit config
         self.cache_limit = 128  # Default limit
-        if config and "cache" in config and "expert_limit" in config["cache"]:
+        if config and "cache" in config and "expert_limit" in config:
             limit = config["cache"]["expert_limit"]
             if limit != "auto":
                 self.cache_limit = int(limit)
@@ -74,14 +81,26 @@ class ExpertLoader:
         # Based on index.json, they are named model.layers.0.mlp.experts.0.gate_proj.weight
         return self.files[filename].get_tensor(weight_name)
 
-    def load_weight(self, weight_name, device="cuda", dtype=None):
+    def load_weight(self, weight_name, device=DEVICE, dtype=None):
         if dtype is None:
             dtype = self.dtype
         tensor = self._get_tensor(weight_name)
         scale_name = f"{weight_name}_scale_inv"
         if scale_name in self.weight_map:
             # Direct transfer to GPU, then cast to dtype on CUDA (16x faster)
-            w = tensor.to(device=device).to(dtype=dtype)
+            if device == "mps" and tensor.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ):
+    # Convert unsupported FP8 weights before moving to MPS
+                w = tensor.to(dtype=torch.float16).to(device=device)
+            elif device == "cpu" and tensor.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ):
+                w = tensor.to(dtype=torch.float16)
+            else:
+                w = tensor.to(device=device).to(dtype=dtype)
             scale = self._get_tensor(scale_name).to(device=device).to(dtype=dtype)
             # Dequantize using reshape and broadcast (25x faster, 0 allocation copy)
             M, N = w.shape
@@ -89,7 +108,7 @@ class ExpertLoader:
         else:
             return tensor.to(device=device).to(dtype=dtype)
 
-    def load_weight_raw(self, weight_name, device="cuda"):
+    def load_weight_raw(self, weight_name, device=DEVICE):
         tensor = self._get_tensor(weight_name)
         scale_name = f"{weight_name}_scale_inv"
         if scale_name in self.weight_map:
@@ -102,14 +121,38 @@ class ExpertLoader:
     def dequantize_weight(self, w_fp8, scale, dtype=None):
         if dtype is None:
             dtype = self.dtype
+
+        # MPS cannot operate directly on FP8 tensors.
+        # Convert on CPU first, then move to the target device.
+        if self.DEVICE == "mps":
+            w = w_fp8.cpu().to(dtype=dtype)
+
+            if scale is None:
+                return w.to("mps")
+
+            scale_d = scale.cpu().to(dtype=dtype)
+
+            M, N = w.shape
+            w = (
+                w.view(M // 128, 128, N // 128, 128)
+                * scale_d.view(M // 128, 1, N // 128, 1)
+            ).view(M, N)
+
+            return w.to("mps")
+
+        # Original path for CUDA / CPU
         if scale is None:
             return w_fp8.to(dtype=dtype)
+
         w = w_fp8.to(dtype=dtype)
         scale_d = scale.to(dtype=dtype)
-        M, N = w.shape
-        return (w.view(M // 128, 128, N // 128, 128) * scale_d.view(M // 128, 1, N // 128, 1)).view(M, N)
 
-    def load_weight_split(self, weight_name, device="cuda", dtype=None):
+        M, N = w.shape
+        return (
+            w.view(M // 128, 128, N // 128, 128)
+            * scale_d.view(M // 128, 1, N // 128, 1)
+        ).view(M, N)
+    def load_weight_split(self, weight_name, device=DEVICE, dtype=None):
         """
         Loads the weight and returns the dequantized weight along with separated
         loading/copy time and dequantization time.
@@ -152,7 +195,7 @@ class ExpertLoader:
         if not torch.cuda.is_available():
             return
         
-        if self.config and "cache" in self.config and "expert_limit" in self.config["cache"]:
+        if self.config and "cache" in self.config and "expert_limit" in self.config:
             if self.config["cache"]["expert_limit"] != "auto":
                 self.cache_limit = int(self.config["cache"]["expert_limit"])
                 return
@@ -214,12 +257,12 @@ class ExpertLoader:
                 self.ram_hits += 1
             gate_fp8_cpu, gate_scale_cpu, up_fp8_cpu, up_scale_cpu, down_fp8_cpu, down_scale_cpu = cached_expert
             # Copy to GPU
-            gate_fp8 = gate_fp8_cpu.to(device="cuda")
-            gate_scale = gate_scale_cpu.to(device="cuda") if gate_scale_cpu is not None else None
-            up_fp8 = up_fp8_cpu.to(device="cuda")
-            up_scale = up_scale_cpu.to(device="cuda") if up_scale_cpu is not None else None
-            down_fp8 = down_fp8_cpu.to(device="cuda")
-            down_scale = down_scale_cpu.to(device="cuda") if down_scale_cpu is not None else None
+            gate_fp8 = gate_fp8_cpu.to(device=self.DEVICE)
+            gate_scale = gate_scale_cpu.to(device=self.DEVICE) if gate_scale_cpu is not None else None
+            up_fp8 = up_fp8_cpu.to(device=self.DEVICE)
+            up_scale = up_scale_cpu.to(device=self.DEVICE) if up_scale_cpu is not None else None
+            down_fp8 = down_fp8_cpu.to(device=self.DEVICE)
+            down_scale = down_scale_cpu.to(device=self.DEVICE) if down_scale_cpu is not None else None
         else:
             with self.lock:
                 self.ssd_hits += 1
@@ -248,12 +291,12 @@ class ExpertLoader:
                 self.ram_cache.put(key, cached_expert)
                 
             # Copy to GPU
-            gate_fp8 = gate_fp8_cpu.to(device="cuda")
-            gate_scale = gate_scale_cpu.to(device="cuda") if gate_scale_cpu is not None else None
-            up_fp8 = up_fp8_cpu.to(device="cuda")
-            up_scale = up_scale_cpu.to(device="cuda") if up_scale_cpu is not None else None
-            down_fp8 = down_fp8_cpu.to(device="cuda")
-            down_scale = down_scale_cpu.to(device="cuda") if down_scale_cpu is not None else None
+            gate_fp8 = gate_fp8_cpu.to(device=self.DEVICE)
+            gate_scale = gate_scale_cpu.to(device=self.DEVICE) if gate_scale_cpu is not None else None
+            up_fp8 = up_fp8_cpu.to(device=self.DEVICE)
+            up_scale = up_scale_cpu.to(device=self.DEVICE) if up_scale_cpu is not None else None
+            down_fp8 = down_fp8_cpu.to(device=self.DEVICE)
+            down_scale = down_scale_cpu.to(device=self.DEVICE) if down_scale_cpu is not None else None
 
         gate_proj = self.dequantize_weight(gate_fp8, gate_scale)
         up_proj = self.dequantize_weight(up_fp8, up_scale)
@@ -281,9 +324,9 @@ class ExpertLoader:
                 print(f"Allocating static GPU cache with {self.num_slots} expert {self.dtype} slots...")
                 
                 # Pre-allocate weights
-                self.static_expert_gate = torch.zeros(self.num_slots, 768, 2048, dtype=self.dtype, device="cuda")
-                self.static_expert_up = torch.zeros(self.num_slots, 768, 2048, dtype=self.dtype, device="cuda")
-                self.static_expert_down = torch.zeros(self.num_slots, 2048, 768, dtype=self.dtype, device="cuda")
+                self.static_expert_gate = torch.zeros(self.num_slots, 768, 2048, dtype=self.dtype, device=self.DEVICE)
+                self.static_expert_up = torch.zeros(self.num_slots, 768, 2048, dtype=self.dtype, device=self.DEVICE)
+                self.static_expert_down = torch.zeros(self.num_slots, 2048, 768, dtype=self.dtype, device=self.DEVICE)
                 
                 self.free_slots = list(range(self.num_slots))
                 self.pinned_slots = set()
@@ -342,12 +385,12 @@ class ExpertLoader:
                 self.ram_hits += 1
             gate_fp8_cpu, gate_scale_cpu, up_fp8_cpu, up_scale_cpu, down_fp8_cpu, down_scale_cpu = cached_expert
             # Copy to GPU
-            gate_fp8 = gate_fp8_cpu.to(device="cuda")
-            gate_scale = gate_scale_cpu.to(device="cuda") if gate_scale_cpu is not None else None
-            up_fp8 = up_fp8_cpu.to(device="cuda")
-            up_scale = up_scale_cpu.to(device="cuda") if up_scale_cpu is not None else None
-            down_fp8 = down_fp8_cpu.to(device="cuda")
-            down_scale = down_scale_cpu.to(device="cuda") if down_scale_cpu is not None else None
+            gate_fp8 = gate_fp8_cpu.to(device=self.DEVICE)
+            gate_scale = gate_scale_cpu.to(device=self.DEVICE) if gate_scale_cpu is not None else None
+            up_fp8 = up_fp8_cpu.to(device=self.DEVICE)
+            up_scale = up_scale_cpu.to(device=self.DEVICE) if up_scale_cpu is not None else None
+            down_fp8 = down_fp8_cpu.to(device=self.DEVICE)
+            down_scale = down_scale_cpu.to(device=self.DEVICE) if down_scale_cpu is not None else None
         else:
             with self.lock:
                 self.ssd_hits += 1
@@ -374,12 +417,12 @@ class ExpertLoader:
                 self.ram_cache.put(key, cached_expert)
                 
             # Copy to GPU
-            gate_fp8 = gate_fp8_cpu.to(device="cuda")
-            gate_scale = gate_scale_cpu.to(device="cuda") if gate_scale_cpu is not None else None
-            up_fp8 = up_fp8_cpu.to(device="cuda")
-            up_scale = up_scale_cpu.to(device="cuda") if up_scale_cpu is not None else None
-            down_fp8 = down_fp8_cpu.to(device="cuda")
-            down_scale = down_scale_cpu.to(device="cuda") if down_scale_cpu is not None else None
+            gate_fp8 = gate_fp8_cpu.to(device=self.DEVICE)
+            gate_scale = gate_scale_cpu.to(device=self.DEVICE) if gate_scale_cpu is not None else None
+            up_fp8 = up_fp8_cpu.to(device=self.DEVICE)
+            up_scale = up_scale_cpu.to(device=self.DEVICE) if up_scale_cpu is not None else None
+            down_fp8 = down_fp8_cpu.to(device=self.DEVICE)
+            down_scale = down_scale_cpu.to(device=self.DEVICE) if down_scale_cpu is not None else None
 
         copy_ms = (time.time() - t_copy_start) * 1000.0
         self.load_ms_accum += copy_ms

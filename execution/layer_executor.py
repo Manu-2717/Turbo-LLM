@@ -30,17 +30,22 @@ class LayerExecutor:
             for name in self.non_moe_weight_names:
                 full_name = f"{prefix}.{name}"
                 w = self.loader.load_weight(full_name)
-                set_module_tensor_to_device(self.model, full_name, device="cuda", value=w)
+                set_module_tensor_to_device(
+                self.model,
+                full_name,
+                device=self.loader.DEVICE,
+                value=w,
+                )
                 
         print("Preloading embedding, norm, and lm_head weights to GPU VRAM...")
         embed_w = self.loader.load_weight("model.embed_tokens.weight")
-        set_module_tensor_to_device(self.model, "model.embed_tokens.weight", device="cuda", value=embed_w)
+        set_module_tensor_to_device(self.model, "model.embed_tokens.weight", device=self.loader.DEVICE, value=embed_w)
         
         norm_w = self.loader.load_weight("model.norm.weight")
-        set_module_tensor_to_device(self.model, "model.norm.weight", device="cuda", value=norm_w)
+        set_module_tensor_to_device(self.model, "model.norm.weight", device=self.loader.DEVICE, value=norm_w)
         
         lm_head_w = self.loader.load_weight("lm_head.weight")
-        set_module_tensor_to_device(self.model, "lm_head.weight", device="cuda", value=lm_head_w)
+        set_module_tensor_to_device(self.model, "lm_head.weight", device=self.loader.DEVICE, value=lm_head_w)
 
     @torch.no_grad()
     def execute_layer(self, layer_id, hidden_states, attention_mask, position_ids, position_embeddings, kv_cache=None):
