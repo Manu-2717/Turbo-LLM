@@ -22,6 +22,8 @@ def generate(model, prompt, max_new_tokens=50, config=None):
     # 1. Initialize Loader
     print(f"Loading weights index from {model}...")
     loader = ExpertLoader(model, config=config)
+    DEVICE = loader.DEVICE
+    
     
     # 2. Load Config and Meta Model
     hf_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
@@ -46,7 +48,7 @@ def generate(model, prompt, max_new_tokens=50, config=None):
     # 4. Tokenizer and Input
     tokenizer = AutoTokenizer.from_pretrained(model)
     print(f"Prompt: {prompt}")
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
     input_ids = inputs.input_ids
     prompt_len = input_ids.shape[1]
 
@@ -69,10 +71,10 @@ def generate(model, prompt, max_new_tokens=50, config=None):
         # Prefill vs Decode setup
         if step == 0:
             input_to_model = input_ids
-            position_ids = torch.arange(prompt_len, device="cuda").unsqueeze(0)
+            position_ids = torch.arange(prompt_len, device=DEVICE).unsqueeze(0)
         else:
             input_to_model = next_token_id.view(1, 1)
-            position_ids = torch.tensor([[prompt_len + step - 1]], device="cuda")
+            position_ids = torch.tensor([[prompt_len + step - 1]], device=DEVICE)
             
         # 5. Embeddings Step
         hidden_states = causal_model.model.embed_tokens(input_to_model)
@@ -112,7 +114,10 @@ def generate(model, prompt, max_new_tokens=50, config=None):
         generated_text += next_token
         
         # Memory tracking
-        vram_allocated = torch.cuda.memory_allocated()
+        if DEVICE == "cuda":
+            vram_allocated = torch.cuda.memory_allocated()
+        else:
+            vram_allocated = 0
         # Assert VRAM < memory limit
         max_vram_bytes = 5.8 * 1024**3
         if config and "memory" in config and "max_vram_mb" in config["memory"]:
@@ -123,7 +128,11 @@ def generate(model, prompt, max_new_tokens=50, config=None):
         kv_bytes = kv_cache.get_memory_bytes()
         kv_mb = kv_bytes / 1024**2
         
-        peak_vram_step = torch.cuda.max_memory_allocated() / 1024**2
+        peak_vram_step = (
+        torch.cuda.max_memory_allocated() / 1024**2
+        if DEVICE == "cuda"
+        else 0
+        )
         step_duration = time.time() - step_start_time
         
         exp_cache_count = len(loader.expert_cache)
@@ -146,7 +155,13 @@ def generate(model, prompt, max_new_tokens=50, config=None):
     print(f"Generated tokens  : {max_new_tokens}")
     print(f"Total time taken  : {duration:.2f} seconds")
     print(f"Speed (tokens/sec): {tokens_per_sec:.2f} tok/s")
-    print(f"Peak VRAM used    : {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+    if DEVICE == "cuda":
+        print(
+        f"Peak VRAM used    : "
+        f"{torch.cuda.max_memory_allocated() / 1024**2:.2f} MB"
+    )
+    else:
+        print("Peak VRAM used    : N/A (non-CUDA device)")
     print(f"Peak System RAM   : {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.2f} MB")
     if hasattr(layer_exec, "attn_times") and len(layer_exec.attn_times) > 0:
         avg_attn = sum(layer_exec.attn_times) / len(layer_exec.attn_times)
