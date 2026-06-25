@@ -1,58 +1,127 @@
 import torch
 
+
 class KVCache:
-    def __init__(self):
-        self.keys = {}
-        self.values = {}
+    """
+    Pre-allocated KV cache with O(1) per-token append.
 
-    def get(self, layer_id):
-        """
-        Returns (key, value) tensors for the given layer, or (None, None) if not present.
-        """
-        return self.keys.get(layer_id), self.values.get(layer_id)
+    Instead of torch.cat (which copies the entire history every token),
+    this allocates a fixed-size buffer up front and writes into it via
+    slice assignment. Returns views of the valid portion — zero copies.
 
-    def append(self, layer_id, k, v):
-        """
-        Appends/concatenates new K and V states to the cache for the given layer.
-        k, v: [batch_size, num_heads, seq_len, head_dim]
-        """
-        if layer_id not in self.keys or self.keys[layer_id] is None:
-            self.keys[layer_id] = k.clone().detach() if hasattr(k, "clone") else k
-            self.values[layer_id] = v.clone().detach() if hasattr(v, "clone") else v
-        else:
-            # Concatenate along the sequence dimension (dim=2)
-            self.keys[layer_id] = torch.cat([self.keys[layer_id], k], dim=2)
-            self.values[layer_id] = torch.cat([self.values[layer_id], v], dim=2)
+    Buffers are lazily allocated per-layer on first update(), so shapes
+    (batch, num_kv_heads, head_dim, dtype) are inferred automatically.
+    """
 
-    def clear(self):
-        """
-        Clears all cached keys and values.
-        """
-        self.keys.clear()
-        self.values.clear()
+    def __init__(self, max_seq_len=4096):
+        self.max_seq_len = max_seq_len
+        self._keys = {}       # layer_idx -> [batch, heads, max_seq_len, dim]
+        self._values = {}     # layer_idx -> [batch, heads, max_seq_len, dim]
+        self._seq_lengths = {}  # layer_idx -> int (current valid length)
+
+    # ------------------------------------------------------------------
+    # HF-compatible interface (called by self_attn.forward)
+    # ------------------------------------------------------------------
 
     def update(self, key_states, value_states, layer_idx):
         """
-        Compatibility method for Hugging Face Transformers attention layer forward pass.
-        Appends new states and returns the full cached states.
+        Appends new KV states and returns the full accumulated states.
+        Called by HuggingFace attention: past_key_values.update(k, v, layer_idx)
+
+        key_states, value_states: [batch, num_kv_heads, new_seq_len, head_dim]
+        Returns: (all_keys, all_values) as views — no copy.
         """
-        self.append(layer_idx, key_states, value_states)
-        return self.keys[layer_idx], self.values[layer_idx]
+        if layer_idx not in self._seq_lengths:
+            self._allocate_layer(layer_idx, key_states)
+
+        start = self._seq_lengths[layer_idx]
+        new_seq = key_states.shape[2]
+        end = start + new_seq
+
+        assert end <= self.max_seq_len, (
+            f"KV cache overflow: tried to store {end} tokens but max_seq_len={self.max_seq_len}. "
+            f"Increase max_seq_len or reduce prompt + max_new_tokens."
+        )
+
+        # O(1) write — just copy the new tokens into the pre-allocated slot
+        self._keys[layer_idx][:, :, start:end, :] = key_states
+        self._values[layer_idx][:, :, start:end, :] = value_states
+        self._seq_lengths[layer_idx] = end
+
+        # Return views of the valid portion (no allocation, no copy)
+        return self._keys[layer_idx][:, :, :end, :], self._values[layer_idx][:, :, :end, :]
+
+    # ------------------------------------------------------------------
+    # Mask interface (called by create_causal_mask → _preprocess_mask_arguments)
+    # ------------------------------------------------------------------
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
-        """
-        Returns the sequence length of cached tokens for the given layer.
-        """
-        if len(self.keys) == 0 or layer_idx not in self.keys or self.keys[layer_idx] is None:
-            return 0
-        return self.keys[layer_idx].shape[-2]
+        """Returns the number of cached tokens for the given layer."""
+        return self._seq_lengths.get(layer_idx, 0)
 
     def get_mask_sizes(self, query_length: int, layer_idx: int) -> tuple[int, int]:
         """
-        Returns a tuple (kv_length, kv_offset) corresponding to the length and offset 
-        of the cache at the given layer index. Used to generate causal masks.
+        Returns (kv_length, kv_offset) for causal mask construction.
+        kv_length = cached tokens + new query tokens.
         """
-        if layer_idx not in self.keys or self.keys[layer_idx] is None:
+        seq_len = self._seq_lengths.get(layer_idx, 0)
+        if seq_len == 0:
             return query_length, 0
-        kv_length = self.get_seq_length(layer_idx) + query_length
-        return kv_length, 0
+        return seq_len + query_length, 0
+
+    # ------------------------------------------------------------------
+    # Query / utility
+    # ------------------------------------------------------------------
+
+    def get(self, layer_idx):
+        """Returns (key_view, value_view) for the valid portion, or (None, None)."""
+        if layer_idx not in self._seq_lengths or self._seq_lengths[layer_idx] == 0:
+            return None, None
+        end = self._seq_lengths[layer_idx]
+        return self._keys[layer_idx][:, :, :end, :], self._values[layer_idx][:, :, :end, :]
+
+    def get_memory_bytes(self) -> int:
+        """Returns bytes used by the valid (filled) portion of the KV cache."""
+        total = 0
+        for layer_idx, length in self._seq_lengths.items():
+            if length > 0:
+                k = self._keys[layer_idx]
+                batch, heads, _, dim = k.shape
+                # K + V, each: batch * heads * length * dim * element_size
+                total += batch * heads * length * dim * k.element_size() * 2
+        return total
+
+    def get_allocated_bytes(self) -> int:
+        """Returns total bytes allocated (including unused buffer space)."""
+        total = 0
+        for k in self._keys.values():
+            total += k.element_size() * k.nelement()
+        for v in self._values.values():
+            total += v.element_size() * v.nelement()
+        return total
+
+    def clear(self):
+        """Frees all buffers."""
+        self._keys.clear()
+        self._values.clear()
+        self._seq_lengths.clear()
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _allocate_layer(self, layer_idx, reference_tensor):
+        """Lazily allocate buffer for one layer, inferring shape from actual tensor."""
+        batch, heads, _, dim = reference_tensor.shape
+        dtype = reference_tensor.dtype
+        device = reference_tensor.device
+
+        self._keys[layer_idx] = torch.zeros(
+            batch, heads, self.max_seq_len, dim,
+            dtype=dtype, device=device
+        )
+        self._values[layer_idx] = torch.zeros(
+            batch, heads, self.max_seq_len, dim,
+            dtype=dtype, device=device
+        )
+        self._seq_lengths[layer_idx] = 0

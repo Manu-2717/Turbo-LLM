@@ -42,7 +42,6 @@ def generate(model, prompt, max_new_tokens=50, config=None):
     router_exec = RouterExecutor(loader, hf_config.num_hidden_layers)
     moe_exec = MoEExecutor(loader)
     layer_exec = LayerExecutor(causal_model, loader, router_exec, moe_exec)
-    kv_cache = KVCache()
 
     # 4. Tokenizer and Input
     tokenizer = AutoTokenizer.from_pretrained(model)
@@ -50,6 +49,9 @@ def generate(model, prompt, max_new_tokens=50, config=None):
     inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
     input_ids = inputs.input_ids
     prompt_len = input_ids.shape[1]
+
+    # 5. KV Cache — pre-allocated for the full generation length
+    kv_cache = KVCache(max_seq_len=prompt_len + max_new_tokens)
     
     print(f"Generating {max_new_tokens} tokens...")
     
@@ -117,14 +119,8 @@ def generate(model, prompt, max_new_tokens=50, config=None):
             max_vram_bytes = config["memory"]["max_vram_mb"] * 1024**2
         assert vram_allocated < max_vram_bytes, f"VRAM allocation {vram_allocated / 1024**3:.2f} GB exceeds limit!"
         
-        # Calculate cache size
-        kv_bytes = 0
-        for k in kv_cache.keys.values():
-            if k is not None:
-                kv_bytes += k.element_size() * k.nelement()
-        for v in kv_cache.values.values():
-            if v is not None:
-                kv_bytes += v.element_size() * v.nelement()
+        # Calculate cache size (valid portion only, not full pre-allocated buffer)
+        kv_bytes = kv_cache.get_memory_bytes()
         kv_mb = kv_bytes / 1024**2
         
         peak_vram_step = torch.cuda.max_memory_allocated() / 1024**2
